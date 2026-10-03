@@ -1,0 +1,430 @@
+# BoltIQ Gold Portfolio Engine --- Day 4 Work Report
+
+## Performance Investigation, Strategy Tester Runtime & MultiScanner Analysis
+
+**Project:** BoltIQ Gold Portfolio Engine\
+**Primary EA:** `BoltIQ_Gold_Portfolio_Engine.mq5`\
+**Environment:** MetaTrader 5 / MetaEditor / Strategy Tester\
+**Day:** 4\
+**Focus:** Strategy Tester performance investigation
+
+------------------------------------------------------------------------
+
+## 1. Day 4 Objective
+
+Day 4 continued the transition from tester preparation into quantitative
+validation.
+
+The main problem was the extremely slow 3-month XAUUSD M15 Strategy
+Tester run.
+
+Observed:
+
+-   Approximately **25 minutes elapsed**
+-   Only approximately **3.6% completed**
+-   If the same rate continued, the run would take roughly **11--12
+    hours**
+-   The run used **1 Minute OHLC**
+
+The goal was to determine whether the delay was primarily caused by:
+
+-   laptop/CPU performance,
+-   MT5 tester workload,
+-   EA computation,
+-   repeated logging,
+-   MultiScanner,
+-   or another code-level bottleneck.
+
+------------------------------------------------------------------------
+
+## 2. Tester Configuration
+
+``` text
+Expert:        BoltIQ_Gold_Portfolio_Engine.ex5
+Symbol:        XAUUSD
+Timeframe:     M15
+Period:        2026-07-01 → 2026-10-01
+Duration:      Approximately 3 months
+Model:         1 Minute OHLC
+Optimization:  Disabled
+Visual mode:   Disabled
+```
+
+------------------------------------------------------------------------
+
+## 3. Main Issue Investigated --- MultiScanner Logging
+
+The tester Journal repeatedly showed:
+
+``` text
+MultiScanner: skipped (MaxShortTrades=0, Phase 2 BUY-only mode)
+```
+
+The relevant code was:
+
+``` cpp
+if(MaxShortTrades == 0)
+{
+   Print("MultiScanner: skipped (MaxShortTrades=0, Phase 2 BUY-only mode)");
+}
+else
+{
+   static bool s_multiScannerInited = false;
+   static string s_scanSymbols[] = {"BTCUSD", "EURUSD", "GBPUSD"};
+   static int s_scanMagic[] = {1050, 1051, 1052};
+   static int s_scanAtrHandle[] = {-1, -1, -1};
+   static int s_scanEma9Handle[] = {-1, -1, -1};
+   static int s_scanEma21Handle[] = {-1, -1, -1};
+   static int s_scanRsiHandle[] = {-1, -1, -1};
+   static datetime s_lastScanTime = 0;
+}
+```
+
+There is only one source-code line producing this particular message,
+but if the code is reached on every `OnTick()` while
+`MaxShortTrades == 0`, that one `Print()` can execute repeatedly across
+a very large number of simulated ticks.
+
+A safer performance pattern is to log the condition only once:
+
+``` cpp
+static bool multiScannerSkipLogged = false;
+
+if(MaxShortTrades == 0)
+{
+   if(!multiScannerSkipLogged)
+   {
+      Print("MultiScanner disabled: MaxShortTrades=0, Phase 2 BUY-only mode");
+      multiScannerSkipLogged = true;
+   }
+}
+else
+{
+   multiScannerSkipLogged = false;
+
+   // Existing MultiScanner code
+}
+```
+
+This does not change trading behavior; it only reduces repeated
+diagnostics.
+
+------------------------------------------------------------------------
+
+## 4. Result After the MultiScanner Investigation
+
+The same historical range was tested again.
+
+The runtime remained approximately in the same range.
+
+This is an important finding:
+
+> The repeated MultiScanner `Print()` is not sufficient to explain the
+> overall very slow Strategy Tester runtime.
+
+Also, because `MaxShortTrades == 0`, the main MultiScanner `else` branch
+is skipped. Therefore the BTCUSD/EURUSD/GBPUSD scanner calculations are
+not currently proven to be the main source of the delay.
+
+------------------------------------------------------------------------
+
+## 5. Current Diagnosis
+
+### Verified
+
+-   The correct BoltIQ EA is running.
+-   The 3-month XAUUSD M15 test is genuinely processing.
+-   The tester is progressing rather than immediately failing.
+-   The runtime is very long.
+-   The repeated MultiScanner message comes from one `Print()`
+    statement.
+-   The main MultiScanner branch is skipped when `MaxShortTrades == 0`.
+-   Reducing/suppressing repeated MultiScanner logging did not
+    materially reduce the overall runtime.
+
+### Current hypothesis
+
+The more likely explanation is the **overall computational workload of
+the EA during historical simulation**.
+
+The EA has a large tick-driven execution path containing multiple
+strategy groups and supporting systems, including:
+
+-   Portfolio strategies
+-   High Trade
+-   Micro Scalp
+-   Challenge logic
+-   Gold Elite
+-   MTF filters
+-   risk and margin checks
+-   position/order scans
+-   pending-order monitoring
+-   closed-trade scanning
+-   news/session/spread checks
+-   telemetry
+-   dashboard/live-state export
+-   ONNX-related logic
+-   multi-symbol infrastructure
+
+This is a hypothesis, not yet a profiler-confirmed single bottleneck.
+
+------------------------------------------------------------------------
+
+## 6. Laptop vs Code Performance
+
+At the end of Day 4, the evidence does **not** establish that the laptop
+is the sole cause.
+
+It also does not yet prove that one particular function in the EA is
+responsible.
+
+The current engineering conclusion is:
+
+> The tester is computationally heavy, and the dominant bottleneck needs
+> to be isolated by tracing/profiling the `OnTick()` execution path.
+
+Slow backtesting by itself does not mean the trading strategy or risk
+architecture is bad.
+
+------------------------------------------------------------------------
+
+## 7. Areas for the Next Performance Investigation
+
+Priority areas:
+
+1.  `OnTick()` and all major functions it calls.
+2.  Repeated `CopyBuffer()` / `CopyRates()` operations.
+3.  Repeated MTF indicator calculations.
+4.  Position/order/history loops.
+5.  Telemetry and dashboard/export frequency.
+6.  ONNX invocation frequency.
+7.  Repeated risk/margin calculations.
+8.  Strategy branches that execute on every tick.
+9.  Opportunities for safe new-bar caching.
+10. Tester-only diagnostic/logging overhead.
+
+A useful optimization pattern is:
+
+``` text
+New H1 bar
+    ↓
+Calculate H1 indicators once
+    ↓
+Cache results
+    ↓
+Reuse cached values for M15 ticks
+```
+
+rather than recalculating unchanged higher-timeframe information on
+every M15 tick.
+
+------------------------------------------------------------------------
+
+## 8. What Was Achieved on Day 4
+
+-   Confirmed the Strategy Tester is running the intended BoltIQ EA.
+-   Measured the very slow processing rate.
+-   Investigated the repeated MultiScanner Journal message.
+-   Located the exact source-code statement generating it.
+-   Confirmed that only one `Print()` statement generates that message.
+-   Confirmed the MultiScanner calculation branch is skipped when
+    `MaxShortTrades == 0`.
+-   Reduced/investigated repeated diagnostic logging.
+-   Re-ran the same historical test range.
+-   Observed that the runtime remained approximately unchanged.
+-   Established that MultiScanner logging is not the sole bottleneck.
+-   Narrowed the investigation toward the broader tick-driven EA
+    workload.
+-   Preserved the rule that performance work must not alter production
+    trading/risk logic.
+
+------------------------------------------------------------------------
+
+## 9. Problems Encountered
+
+### Problem 1 --- Extremely slow historical test
+
+Approximately 25 minutes produced only 3.6% progress, implying roughly
+11--12 hours at the same processing rate.
+
+### Problem 2 --- Repeated MultiScanner diagnostic output
+
+The tester repeatedly printed the same skip message from the
+`MaxShortTrades == 0` guard.
+
+### Problem 3 --- Logging mitigation did not solve the main problem
+
+The second run took approximately the same amount of time.
+
+### Problem 4 --- No profiler evidence yet
+
+The exact function consuming the majority of tester time has not yet
+been isolated.
+
+Therefore, no single code section should currently be blamed as the
+confirmed bottleneck.
+
+------------------------------------------------------------------------
+
+## 10. Changes Intentionally NOT Made
+
+Day 4 did not intentionally:
+
+-   remove risk gates,
+-   remove emergency protections,
+-   change position sizing,
+-   change SL/TP logic,
+-   change entry conditions,
+-   change exit conditions,
+-   change ONNX decision rules,
+-   remove portfolio risk controls,
+-   change production execution behavior.
+
+The performance investigation remains separate from strategy redesign.
+
+------------------------------------------------------------------------
+
+## 11. Evidence Classification
+
+  -----------------------------------------------------------------------
+  Finding                             Classification
+  ----------------------------------- -----------------------------------
+  Correct BoltIQ EA is running        Verified
+
+  3-month XAUUSD M15 test is very     Verified
+  slow                                
+
+  \~3.6% progress after \~25 minutes  Observed
+
+  MultiScanner skip message comes     Verified
+  from one `Print()`                  
+
+  MultiScanner branch is skipped with Verified
+  `MaxShortTrades=0`                  
+
+  Logging reduction did not           Observed
+  materially improve runtime          
+
+  MultiScanner is the main bottleneck Not supported by current evidence
+
+  Overall EA computational workload   Strong hypothesis
+  contributes to runtime              
+
+  Laptop is the sole cause            Not established
+
+  One specific function is the        Not yet tested
+  dominant bottleneck                 
+  -----------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+## 12. Message to Founder
+
+Hi Yug,
+
+I wanted to give you a Day 4 update on the BoltIQ Strategy Tester
+validation.
+
+The main issue today was tester performance. I ran the BoltIQ Gold
+Portfolio Engine on XAUUSD M15 for the same approximately 3-month
+historical range using 1 Minute OHLC. The test was progressing extremely
+slowly --- around 25 minutes for only \~3.6% of the test range, which
+projects to roughly 11--12 hours if the speed remains similar.
+
+I investigated the repeated
+`MultiScanner: skipped (MaxShortTrades=0, Phase 2 BUY-only mode)`
+message in the tester Journal. I traced it to a single `Print()`
+statement in the MultiScanner guard. Because this section can be reached
+repeatedly from the tick path, I investigated/suppressed the repeated
+diagnostic output.
+
+However, after rerunning the same test range, the overall runtime
+remained approximately the same.
+
+This suggests that the MultiScanner logging is not the main bottleneck.
+Also, because `MaxShortTrades=0`, the actual MultiScanner calculation
+branch is skipped, so the BTCUSD/EURUSD/GBPUSD scanner calculations are
+not currently the main explanation either.
+
+My current assessment is that the EA is computationally heavy during
+historical simulation because of the amount of work connected to the
+tick path --- multiple strategies, MTF filters, risk/margin checks,
+position/order scans, telemetry, dashboard/export, ONNX-related
+processing and other safety gates. I don't want to claim a specific
+bottleneck without evidence.
+
+My next step is to trace/profile the main `OnTick()` execution path and
+identify which operations are consuming the tester time, while keeping
+the production trading and risk logic unchanged.
+
+The key result from today is that we have ruled out the repeated
+MultiScanner log as the sole cause and narrowed the problem to the
+broader EA/tester workload.
+
+------------------------------------------------------------------------
+
+## 13. Day 5 Proposed Focus
+
+``` text
+Performance profiling
+        ↓
+Map OnTick() execution
+        ↓
+Find repeated calculations
+        ↓
+Measure indicator/data access
+        ↓
+Measure position/order scans
+        ↓
+Measure telemetry/ONNX frequency
+        ↓
+Apply behavior-preserving optimization
+        ↓
+Run the same test again
+        ↓
+Compare runtime + trading results
+```
+
+Any optimization should satisfy:
+
+``` text
+Performance improvement
+        +
+Same strategy logic
+        +
+Same risk controls
+        +
+Same execution rules
+        +
+Documented change
+```
+
+------------------------------------------------------------------------
+
+## 14. Day 4 Conclusion
+
+Day 4 did not produce final quantitative trading results because the
+historical tester run remains computationally expensive.
+
+However, it produced an important engineering result:
+
+``` text
+Slow Strategy Tester
+        ↓
+Investigate MultiScanner logging
+        ↓
+Identify repeated Print()
+        ↓
+Reduce repeated diagnostic output
+        ↓
+Re-run same test range
+        ↓
+Runtime remains approximately unchanged
+        ↓
+MultiScanner logging is NOT the main bottleneck
+        ↓
+Investigate complete OnTick computational path
+```
+
+**Day 4 status: Performance investigation in progress; dominant
+bottleneck not yet isolated.**
